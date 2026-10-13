@@ -609,8 +609,31 @@ class WatchdogTests(unittest.TestCase):
                 directory = root / ('app-' + version)
                 directory.mkdir()
                 (directory / 'claude.exe').touch()
+                (directory / 'resources').mkdir()
+                for asset in ['resources/app.asar', 'icudtl.dat', 'resources.pak']:
+                    (directory / asset).touch()
             self.assertEqual(guard.claude_binary({'claude_executable': str(root / 'claude.exe')}),
                              root / 'app-2.1.0/claude.exe')
+
+    def test_partially_extracted_update_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            complete = root / 'app-2.1.0'
+            (complete / 'resources').mkdir(parents=True)
+            for asset in ['claude.exe', 'resources/app.asar', 'icudtl.dat', 'resources.pak']:
+                (complete / asset).touch()
+            incomplete = root / 'app-3.0.0'
+            incomplete.mkdir()
+            (incomplete / 'claude.exe').touch()
+            self.assertEqual(guard.claude_binary({'claude_executable': str(root / 'claude.exe')}), complete / 'claude.exe')
+
+    def test_firewall_json_can_be_captured_by_the_installer_pipeline(self):
+        reply = subprocess.run([str(Path(guard.os.environ['WINDIR']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+                                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+                                str(source.parent / 'tests/check-json-capture.ps1'), str(source.parent / 'check-firewall.ps1')],
+                               capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(reply.returncode, 0, reply.stderr.decode('utf-8', errors='replace'))
+        self.assertIsInstance(json.loads(reply.stdout.decode('utf-8-sig'))['ok'], bool)
 
 
 class RuleRoutingTests(unittest.TestCase):

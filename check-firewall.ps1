@@ -53,10 +53,14 @@ function Test-GuardFirewall {
 
 do {
     $guardResult = Test-GuardFirewall
-    [Console]::WriteLine(($guardResult | ConvertTo-Json -Compress))
-    [Console]::Out.Flush()
+    $guardJson = $guardResult | ConvertTo-Json -Compress
     if (-not $Watch) {
+        # The installer captures PowerShell pipeline output. Console.WriteLine
+        # bypasses that pipeline and incorrectly reports a failed installation.
+        Write-Output $guardJson
         if ($guardResult.ok) { exit 0 } else { exit 1 }
     }
+    [Console]::WriteLine($guardJson)
+    [Console]::Out.Flush()
     [Threading.Thread]::Sleep(1000)
 } while ($true)

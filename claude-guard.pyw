@@ -949,10 +949,11 @@ def claude_binary(config):
             version = tuple(int(part) for part in directory.name[4:].split("."))
         except ValueError:
             continue
-        if binary.is_file():
+        required_assets = (directory / "resources/app.asar", directory / "icudtl.dat", directory / "resources.pak")
+        if binary.is_file() and all(asset.is_file() for asset in required_assets):
             versions.append((version, binary))
     if not versions:
-        raise GuardError("未找到可在进程保护下直接启动的 Claude 程序。")
+        raise GuardError("未找到完整的 Claude 程序，可能有更新尚未完成。请先修复安装。")
     return max(versions)[1]
 
 
