@@ -1,0 +1,16 @@
+{
+  "proxy_url": "http://127.0.0.1:7897",
+  "claude_executable": "%LOCALAPPDATA%\\AnthropicClaude\\claude.exe",
+  "clash_config": "%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\clash-verge.yaml",
+  "require_tun": true,
+  "require_firewall": true,
+  "request_timeout_seconds": 10,
+  "watch_interval_seconds": 0.25,
+  "controller_timeout_seconds": 0.8,
+  "runtime_check_interval_seconds": 1,
+  "remote_check_interval_seconds": 5,
+  "remote_timeout_seconds": 8,
+  "connectivity_timeout_seconds": 5,
+  "upstream_retry_delay_seconds": 1,
+  "allowed_exit_ips": []
+}
