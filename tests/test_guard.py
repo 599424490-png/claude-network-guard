@@ -588,5 +588,106 @@ class WatchdogTests(unittest.TestCase):
                              root / 'app-2.1.0/claude.exe')
 
 
+class FirewallWatcherTests(unittest.TestCase):
+    def watcher(self):
+        self.clock = 0
+        self.events = []
+        with mock.patch.object(guard.threading, 'Thread'):
+            return guard.FirewallWatcher(clock=lambda: self.clock,
+                event_writer=lambda status, message, **kwargs: self.events.append(status))
+
+    def test_transient_query_error_does_not_override_recent_verified_rules(self):
+        watcher = self.watcher()
+        watcher.accept({'ok': True, 'protected_programs': 14})
+        self.clock = 1
+        watcher.accept({'ok': False, 'code': 'checker_exception', 'error_category': 'COMException'})
+        self.assertTrue(watcher.check()['ok'])
+        self.assertEqual(watcher.last_time, 0)
+        self.assertEqual(self.events, ['firewall-check-unavailable'])
+
+    def test_repeated_query_errors_cannot_extend_freshness_deadline(self):
+        watcher = self.watcher()
+        watcher.accept({'ok': True})
+        for second in range(1, 7):
+            self.clock = second
+            watcher.accept({'ok': False, 'code': 'checker_exception'})
+        with self.assertRaisesRegex(guard.GuardError, '5'):
+            watcher.check()
+
+    def test_explicit_firewall_fault_is_immediate_and_latched(self):
+        for code in ['profile_disabled', 'policy_overridden', 'rule_missing', 'rule_invalid',
+                     'self_test_missing', 'self_test_failed']:
+            watcher = self.watcher()
+            watcher.accept({'ok': True})
+            watcher.accept({'ok': False, 'code': code})
+            with self.assertRaises(guard.GuardError):
+                watcher.check()
+            watcher.accept({'ok': True})
+            with self.assertRaises(guard.GuardError):
+                watcher.check()
+
+    def test_query_error_before_first_valid_check_is_rejected(self):
+        watcher = self.watcher()
+        watcher.accept({'ok': False, 'code': 'checker_exception'})
+        with self.assertRaises(guard.GuardError):
+            watcher.check()
+
+    def test_valid_recovery_updates_freshness_and_records_recovery(self):
+        watcher = self.watcher()
+        watcher.accept({'ok': True})
+        self.clock = 1
+        watcher.accept({'ok': False, 'code': 'checker_exception'})
+        self.clock = 4
+        watcher.accept({'ok': True})
+        self.clock = 8
+        self.assertTrue(watcher.check()['ok'])
+        self.assertEqual(self.events, ['firewall-check-unavailable', 'firewall-check-recovered'])
+
+    def test_invalid_checker_response_is_rejected(self):
+        watcher = self.watcher()
+        with self.assertRaises(ValueError):
+            watcher.accept({'ok': 'true'})
+
+    def test_persistent_verifier_launches_only_once_and_closes_on_cleanup(self):
+        watcher = self.watcher()
+        class FakeProcess:
+            def __init__(self):
+                self.terminated = False
+                self.stdout = self
+                self.lines = iter([b'{"ok":true}\n', b'{"ok":true}\n'])
+            def readline(self, *_):
+                try:
+                    return next(self.lines)
+                except StopIteration:
+                    watcher.stop_event.set()
+                    return b''
+            def poll(self):
+                return 0 if self.terminated else None
+            def terminate(self):
+                self.terminated = True
+            def wait(self, **kwargs):
+                return 0
+            def close(self):
+                pass
+        process = FakeProcess()
+        with mock.patch.object(guard.subprocess, 'Popen', return_value=process) as launch:
+            watcher.worker()
+        self.assertTrue(watcher.check()['ok'])
+        self.assertEqual(launch.call_count, 1)
+        self.assertIn('-Watch', launch.call_args.args[0])
+        self.assertTrue(process.terminated)
+
+    def test_verifier_process_exit_is_fail_closed(self):
+        watcher = self.watcher()
+        process = mock.Mock()
+        process.stdout.readline.return_value = b''
+        process.poll.return_value = 0
+        with mock.patch.object(guard.subprocess, 'Popen', return_value=process):
+            watcher.worker()
+        with self.assertRaises(guard.GuardError):
+            watcher.check()
+        self.assertEqual(self.events, ['firewall-checker-stopped'])
+
+
 if __name__ == '__main__':
     unittest.main()

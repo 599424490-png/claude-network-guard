@@ -445,38 +445,114 @@ def check_firewall():
 
 
 class FirewallWatcher:
-    def __init__(self, checker=check_firewall, clock=time.monotonic):
+    def __init__(self, checker=None, clock=time.monotonic, event_writer=None):
         self.checker, self.clock = checker, clock
+        self.event_writer = event_writer or record
         self.ready = threading.Event()
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.last_result = self.last_time = None
+        self.process = None
+        self.query_unavailable = False
+        self.policy_fault = None
         threading.Thread(target=self.worker, daemon=True).start()
 
-    def worker(self):
-        while not self.stop_event.is_set():
-            try:
-                result = (True, self.checker())
-            except Exception as exc:
-                result = (False, exc)
+    def publish(self, result):
+        with self.lock:
+            self.last_result, self.last_time = result, self.clock()
+        self.ready.set()
+
+    def accept(self, data):
+        if self.policy_fault is not None:
+            return  # A detected policy failure stays fatal until relaunch.
+        if data.get("ok") is True:
+            if self.query_unavailable:
+                self.event_writer("firewall-check-recovered", "防火墙核验工具已恢复，规则仍有效。")
+            self.query_unavailable = False
+            self.publish((True, data))
+            return
+        if data.get("ok") is not False:
+            raise ValueError("Invalid firewall verification response")
+        code = data.get("code", "unknown")
+        if code == "checker_exception":
+            if not self.query_unavailable:
+                self.event_writer("firewall-check-unavailable", "防火墙核验工具读取异常，正在重试。",
+                                  diagnostics=[{"error_category": str(data.get("error_category", "unknown"))[:120]}])
+            self.query_unavailable = True
             with self.lock:
-                self.last_result, self.last_time = result, self.clock()
-            self.ready.set()
-            self.stop_event.wait(1)
+                last = self.last_result
+            # An unreadable query does not extend the latest successful check.
+            # The strict five-second freshness limit still applies.
+            if last and last[0]:
+                return
+            self.publish((False, GuardError("防火墙核验工具无法读取规则，尚未取得有效核验结果。")))
+            return
+        reasons = {"profile_disabled": "Windows 防火墙被关闭。",
+                   "policy_overridden": "防火墙规则被系统策略覆盖。",
+                   "self_test_missing": "防火墙安装验证记录缺失。",
+                   "self_test_failed": "防火墙安装验证未通过。",
+                   "rule_missing": "防火墙规则缺失，或出现尚未覆盖的新程序。",
+                   "rule_invalid": "防火墙规则被修改，直连限制不完整。"}
+        message = reasons.get(code, "防火墙核验返回未知异常，无法保持保护。")
+        self.event_writer("firewall-policy-fault", message, diagnostics=[{"error_category": code}])
+        self.policy_fault = GuardError(message)
+        self.publish((False, self.policy_fault))
+
+    def worker(self):
+        if self.checker is not None:
+            while not self.stop_event.is_set():
+                try:
+                    self.publish((True, self.checker()))
+                except Exception as exc:
+                    self.publish((False, exc))
+                self.stop_event.wait(1)
+            return
+        process = None
+        try:
+            executable = Path(os.environ["WINDIR"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            process = subprocess.Popen([str(executable), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                        "-File", str(ROOT / "check-firewall.ps1"), "-Watch"],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
+            self.process = process
+            while not self.stop_event.is_set():
+                line = process.stdout.readline(16385)
+                if not line or len(line) > 16384:
+                    raise GuardError("防火墙核验进程已退出或返回无效响应。")
+                self.accept(json.loads(line.decode("utf-8-sig")))
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.event_writer("firewall-checker-stopped", "防火墙核验进程异常结束。",
+                                  diagnostics=[{"error_category": type(exc).__name__}])
+                self.publish((False, GuardError("防火墙核验进程异常，无法持续确认保护。")))
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                if process.stdout:
+                    process.stdout.close()
 
     def check(self):
-        if not self.ready.wait(4.5):
-            raise GuardError("防火墙核验超时。")
+        if not self.ready.wait(10):
+            raise GuardError("防火墙核验进程未能及时启动。")
         with self.lock:
             result, timestamp = self.last_result, self.last_time
         if not result or not result[0]:
-            raise GuardError("防火墙直连保护失效。")
+            message = str(result[1]) if result and isinstance(result[1], GuardError) else "防火墙核验失败。"
+            raise GuardError(message) from (result[1] if result else None)
         if self.clock() - timestamp > 5:
-            raise GuardError("防火墙核验没有及时完成。")
+            raise GuardError("防火墙核验结果已超过 5 秒未更新，无法持续确认保护。")
         return result[1]
 
     def close(self):
         self.stop_event.set()
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
 
 
 def force_close_claude():
@@ -489,7 +565,13 @@ def force_close_claude():
                        timeout=4, creationflags=subprocess.CREATE_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return not claude_pids()
+    # Job termination is asynchronous: wait for teardown before kill-failed.
+    deadline = time.monotonic() + 2
+    while claude_pids():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def local_proxy_alive():
