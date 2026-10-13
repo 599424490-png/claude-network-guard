@@ -16,3 +16,4 @@ shortcut-manifest.json
 original-shortcuts/
 previous-version/
 *.bak
+private-route-backups/

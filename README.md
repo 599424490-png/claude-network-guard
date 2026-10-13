@@ -18,8 +18,8 @@ A Windows launcher and firewall guard for Claude Desktop with Clash Verge / Miho
 
 - Windows 10/11，推荐 64 位 Python 3.11 或更新版本，安装时包含 `py` 启动器。
 - Claude Desktop 安装在 `%LOCALAPPDATA%\AnthropicClaude`，且存在 `app-*\claude.exe`。其他安装布局目前不支持直接启动。
-- Clash Verge Rev / Mihomo，启用系统代理、**global 全局模式、TUN 和 auto-route**。
-- 当前版本固定使用 `http://127.0.0.1:7897`；配置中的其他代理地址会被拒绝。
+- Clash Verge Rev / Mihomo，启用系统代理、**rule 规则模式或 global 全局模式、TUN 和 auto-route**。规则模式需安装下面的专用入口配置。
+- 普通系统代理保持 `http://127.0.0.1:7897`。Claude 专用入口使用 `http://127.0.0.1:17897`；未配置专用入口时仅支持原来的全局模式。
 - `GLOBAL` 策略链必须使用手动选择的 Selector 和真实节点；DIRECT、自动切换组及负载均衡不放行。
 - 安装防火墙规则需要管理员权限；运行保护器不需要管理员权限。
 
@@ -41,6 +41,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
 先在 Clash Verge 中选择代理节点并启用上述设置，再彻底退出已有 Claude，包括托盘实例。以后通过 **Claude (Network Guard)** 启动。启动失败时会显示中文原因；保护失败时先关闭程序，再提示原因。
 
 配置文件 `guard-config.json` 支持 `%LOCALAPPDATA%`、`%APPDATA%` 等环境变量。默认不固定国家或 IP；`allowed_exit_ips` 为空时接受启动时选中代理的当前出口，并在运行中检查是否变化。
+
+## 使用规则模式
+
+完成防火墙安装后，彻底退出 Claude，在仓库目录运行：
+
+```powershell
+py -3 .\configure-rule-mode.py
+```
+
+自动配置目前支持 Clash Verge 的**本地配置文件**。它给 Claude 添加一个只监听 `127.0.0.1:17897` 的独立 Mixed 入站，固定交给当前手动选中的代理或策略组，不受后面的普通分流规则影响。系统代理仍用 `7897`，其他软件的原有规则保留；不切换全局模式。
+
+同时添加首条 `IN-PORT` 强制路由与已覆盖 Claude 程序的 `PROCESS-PATH` 路由，防止程序转用普通系统代理时落到后面的 `DIRECT` 规则。安装器会更新启动器的 `proxy_url` 和 `rule_proxy_name`，并在本机 `private-route-backups/` 保留修改前文件。备份可能含代理凭据，已从版本控制排除，勿公开上传。
+
+保护器核验专用端口所属进程与 Mihomo 控制器一致、首条强制规则和进程路由完整、代理链没有 DIRECT，并检查相关活动连接的真实出站链。IP 查询与连通复核也使用专用入口。关闭或更改保护规则、新版程序缺少进程路由、检测到 DIRECT/其他节点时拒绝运行。
+
+切换订阅、配置或更新 Claude 后，先重新安装防火墙，再按需重新执行该命令。订阅配置目前不自动改写，避免被更新覆盖；可参照 [Mihomo 入站配置](https://wiki.metacubex.one/config/inbound/listeners/) 手动配置对应入口与规则。
 
 ```json
 "allowed_exit_ips": ["你确认可信的公网 IPv4"]
@@ -73,6 +89,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\restore-firewall.ps1
 本地端口和系统代理约每 0.25 秒检查一次；Clash 路由与防火墙约每秒核验。IP 检测每轮最多 8 秒，完成后等待 5 秒。上游复核每轮最多 5 秒，两轮间隔 1 秒，因此远端故障通常在约 25 秒内处理；系统繁忙时可能更久。复核过程中防火墙继续限制已覆盖程序的直连。
 
 防火墙核验使用一个常驻 PowerShell 进程，避免每秒创建新进程造成额外启动开销。明确发现防火墙关闭、规则缺失或修改时立即触发退出；核验工具的临时 COM/文件读取错误会重试，但不能延长最近成功核验的有效期。超过 5 秒未取得有效结果、核验进程退出或返回无效响应时仍强退；后台检查存在轮询延迟。错误日志区分工具异常与明确规则故障。
+
+Clash 本地接口在配置重载期间短暂超时也会有限重试；最近有效路由核验超过 5 秒未更新时关闭 Claude。明确返回直连模式、缺失规则或不安全出站仍立即拒绝。
 
 HTTPS 复核证明代理仍能承载请求；IP 查询恢复前无法重新确认公网出口。多个检测网站持续不可达也可能造成保守强退，不能当作节点实际掉线的绝对证据。强退可能丢失未保存内容。
 

@@ -8,6 +8,7 @@ import ipaddress
 import io
 import json
 import os
+import msvcrt
 from pathlib import Path
 import queue
 import socket
@@ -42,6 +43,14 @@ class ProbeUnavailable(GuardError):
         self.diagnostics = diagnostics or []
 
 
+class ControllerUnavailable(GuardError):
+    pass
+
+
+def proxy_port(config):
+    return 17897 if config["proxy_url"] == "http://127.0.0.1:17897" else 7897
+
+
 def load_config():
     config = json.loads((ROOT / "guard-config.json").read_text(encoding="utf-8-sig"))
     for name in ("claude_executable", "clash_config"):
@@ -49,7 +58,7 @@ def load_config():
         if not isinstance(value, str) or not value:
             raise GuardError("程序路径配置无效。")
         config[name] = os.path.expandvars(os.path.expanduser(value))
-    if config.get("proxy_url") != "http://127.0.0.1:7897":
+    if config.get("proxy_url") not in {"http://127.0.0.1:7897", "http://127.0.0.1:17897"}:
         raise GuardError("代理地址不在已核验范围。请先重新核验启动器配置。")
     timeout = config.get("request_timeout_seconds", 10)
     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 30:
@@ -84,7 +93,7 @@ def bounded_call(fn, seconds=6):
     try:
         ok, value = result.get(timeout=seconds)
     except queue.Empty:
-        raise GuardError("读取 Clash 运行状态超时，拒绝启动。") from None
+        raise ControllerUnavailable("读取 Clash 运行状态超时。") from None
     if not ok:
         categories = []
         cause = value
@@ -95,7 +104,7 @@ def bounded_call(fn, seconds=6):
             categories.append(category)
             cause = cause.__cause__
         record("controller-query-failed", "Clash 本地接口读取失败。", diagnostics=categories)
-        raise GuardError("无法读取 Clash 运行状态，拒绝启动。") from value
+        raise ControllerUnavailable("无法读取 Clash 运行状态。") from value
     return value
 
 
@@ -106,6 +115,7 @@ class Controller:
         if len(pipes) != 1:
             raise GuardError("未找到唯一的 Clash 代理内核。请先启动 Clash Verge。")
         self.pipe = pipes[0]
+        self.server_pid = None
         self.secret = ""
         try:
             import yaml
@@ -119,7 +129,7 @@ class Controller:
             raise GuardError("代理控制器配置无效。")
 
     def get(self, path, timeout=6):
-        if path not in {"/configs", "/proxies"}:
+        if path not in {"/configs", "/proxies", "/rules", "/connections"}:
             raise GuardError("不允许的代理控制器请求。")
 
         deadline = time.monotonic() + timeout
@@ -149,6 +159,12 @@ class Controller:
             sock = PipeSocket(self.pipe)
             response = None
             try:
+                if hasattr(self, "server_pid"):
+                    owner = wintypes.DWORD()
+                    handle = msvcrt.get_osfhandle(sock.file.fileno())
+                    if not KERNEL.GetNamedPipeServerProcessId(handle, ctypes.byref(owner)):
+                        raise GuardError("无法核验 Clash 控制器所属进程。")
+                    self.server_pid = owner.value
                 headers = f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
                 if self.secret:
                     headers += f"Authorization: Bearer {self.secret}\r\n"
@@ -234,21 +250,61 @@ def resolve_proxy_chain(proxies, name="GLOBAL"):
         return tuple(chain), node_type
 
 
-def validate_runtime(runtime, proxies, require_tun=True):
-    if runtime.get("mode") != "global":
-        raise GuardError("Clash 不是全局代理模式。规则模式可能让 Claude 单独直连，请切到全局模式后重试。")
+def validate_runtime(runtime, proxies, require_tun=True, rules=None, dedicated=False, route_name="GLOBAL"):
+    if runtime.get("mode") not in {"global", "rule"}:
+        raise GuardError("Clash 处于直连或未知模式，拒绝运行。")
+    if runtime.get("mode") == "rule" and not dedicated:
+        raise GuardError("规则模式需要 Claude 专用的 127.0.0.1:17897 代理入口。")
+    if dedicated:
+        if not rules or rules[0].get("type") != "InPort" or str(rules[0].get("payload")) != "17897" or rules[0].get("proxy") != route_name:
+            raise GuardError("Claude 专用入口的首条强制代理规则缺失或被修改。")
     if runtime.get("mixed-port") != 7897:
         raise GuardError("Clash 运行端口与系统代理不一致，拒绝启动。")
     tun = runtime.get("tun") or {}
     if require_tun and (tun.get("enable") is not True or tun.get("auto-route") is not True):
         raise GuardError("Clash TUN 或自动路由未开启，无法核验原生连接的出口，拒绝启动。")
-    return resolve_proxy_chain(proxies)
+    return resolve_proxy_chain(proxies, route_name if dedicated else "GLOBAL")
 
 
-def proxy_exit_ip(host, path, timeout):
+def validate_live_route(config, controller, runtime, proxies):
+    dedicated = proxy_port(config) == 17897
+    rules = controller.get("/rules", timeout=config.get("controller_timeout_seconds", 6))["rules"] if dedicated else None
+    route_name = config.get("rule_proxy_name", "GLOBAL")
+    chain = validate_runtime(runtime, proxies, config["require_tun"], rules, dedicated, route_name)
+    if dedicated:
+        try:
+            programs = json.loads((ROOT / "firewall-manifest.json").read_text(encoding="utf-8-sig"))["programs"]
+        except (OSError, ValueError, KeyError) as exc:
+            raise GuardError("无法核验 Claude 程序的备用代理路由。") from exc
+        if not programs or len(rules) < len(programs) + 1:
+            raise GuardError("Claude 程序的备用代理路由不完整。")
+        for program, rule in zip(programs, rules[1:]):
+            if rule.get("type") != "ProcessPath" or str(rule.get("payload", "")).casefold() != str(program).casefold() or rule.get("proxy") != route_name:
+                raise GuardError("Claude 程序的备用代理路由缺失或被覆盖。")
+    if dedicated and not listener_owned_by(17897, controller.server_pid):
+        raise GuardError("Claude 专用代理端口不属于已核验的 Clash 进程。")
+    if dedicated:
+        expected_paths = {str(path).casefold() for path in programs}
+        connections = controller.get("/connections", timeout=config.get("controller_timeout_seconds", 6))["connections"]
+        for connection in connections:
+            metadata = connection.get("metadata") or {}
+            protected = (str(metadata.get("inboundPort")) == "17897" or
+                         metadata.get("inboundName") == "ClaudeNetworkGuard" or
+                         str(metadata.get("processPath", "")).casefold() in expected_paths)
+            if not protected:
+                continue
+            chains = connection.get("chains") or []
+            if chains and (any(str(name).upper() == "DIRECT" for name in chains) or chain[0][-1] not in chains):
+                raise GuardError("检测到 Claude 相关连接绕过选定代理节点，拒绝继续运行。")
+            if not chains and (connection.get("upload", 0) or connection.get("download", 0)):
+                raise GuardError("Claude 相关连接已有流量但无法确认其代理路线。")
+    return chain
+
+
+def proxy_exit_ip(host, path, timeout, port=7897):
     # Explicit CONNECT; environment NO_PROXY, PAC and redirect rules are ignored.
     # There is no direct connection or direct-IP comparison request.
-    conn = http.client.HTTPSConnection("127.0.0.1", 7897, timeout=timeout,
+    conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout,
                                        context=ssl.create_default_context())
     conn.set_tunnel(host, 443)
     try:
@@ -270,12 +326,12 @@ def proxy_exit_ip(host, path, timeout):
         conn.close()
 
 
-def proxy_connectivity(host, path, timeout):
+def proxy_connectivity(host, path, timeout, port=7897):
     # TLS certificate validation and CONNECT are mandatory. No redirects,
     # alternative proxy or direct connection are attempted after a failure.
     if (host, path) not in CONNECTIVITY_CHECKS:
         raise GuardError("不允许的连通复核地址。")
-    conn = http.client.HTTPSConnection("127.0.0.1", 7897, timeout=timeout,
+    conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout,
                                        context=ssl.create_default_context())
     conn.set_tunnel(host, 443)
     try:
@@ -295,6 +351,37 @@ def proxy_connectivity(host, path, timeout):
 KERNEL = ctypes.WinDLL("kernel32", use_last_error=True)
 KERNEL.CloseHandle.argtypes = [wintypes.HANDLE]
 KERNEL.CloseHandle.restype = wintypes.BOOL
+KERNEL.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+KERNEL.GetNamedPipeServerProcessId.restype = wintypes.BOOL
+
+
+class TcpOwnerRow(ctypes.Structure):
+    _fields_ = [(name, wintypes.DWORD) for name in ("state", "local_address", "local_port", "remote_address", "remote_port", "pid")]
+
+
+def listener_owned_by(port, pid):
+    if not pid:
+        return False
+    api = ctypes.WinDLL("iphlpapi", use_last_error=True).GetExtendedTcpTable
+    api.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+                    wintypes.ULONG, ctypes.c_int, wintypes.ULONG]
+    api.restype = wintypes.DWORD
+    size = wintypes.DWORD()
+    api(None, ctypes.byref(size), False, socket.AF_INET, 3, 0)
+    if not 4 <= size.value <= 4 * 1024 * 1024:
+        raise GuardError("无法读取本机代理监听端口。")
+    buffer = ctypes.create_string_buffer(size.value)
+    if api(buffer, ctypes.byref(size), False, socket.AF_INET, 3, 0) != 0:
+        raise GuardError("无法核验本机代理监听端口。")
+    count = wintypes.DWORD.from_buffer(buffer).value
+    if 4 + count * ctypes.sizeof(TcpOwnerRow) > size.value:
+        raise GuardError("代理监听端口表无效。")
+    matches = []
+    for index in range(count):
+        row = TcpOwnerRow.from_buffer(buffer, 4 + index * ctypes.sizeof(TcpOwnerRow))
+        if socket.ntohs(row.local_port & 0xFFFF) == port:
+            matches.append(row.pid == pid and row.local_address == int.from_bytes(socket.inet_aton("127.0.0.1"), "little"))
+    return bool(matches) and all(matches)
 KERNEL.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
 KERNEL.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 
@@ -574,9 +661,9 @@ def force_close_claude():
     return True
 
 
-def local_proxy_alive():
+def local_proxy_alive(port=7897):
     try:
-        with socket.create_connection(("127.0.0.1", 7897), timeout=0.2):
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
             return True
     except OSError:
         raise GuardError("本地代理端口已断开。") from None
@@ -636,8 +723,10 @@ class ParallelProxyProbe:
 
 
 class ExitProbe(ParallelProxyProbe):
-    def __init__(self, timeout, probe=proxy_exit_ip, clock=time.monotonic, expected_ip=None):
+    def __init__(self, timeout, probe=proxy_exit_ip, clock=time.monotonic, expected_ip=None, port=7897):
         self.expected_ip = expected_ip
+        if probe is proxy_exit_ip:
+            probe = lambda host, path, seconds: proxy_exit_ip(host, path, seconds, port=port)
         super().__init__(timeout, IP_CHECKS, probe, clock)
 
     def poll(self):
@@ -656,7 +745,9 @@ class ExitProbe(ParallelProxyProbe):
 
 
 class ConnectivityProbe(ParallelProxyProbe):
-    def __init__(self, timeout, probe=proxy_connectivity, clock=time.monotonic):
+    def __init__(self, timeout, probe=proxy_connectivity, clock=time.monotonic, port=7897):
+        if probe is proxy_connectivity:
+            probe = lambda host, path, seconds: proxy_connectivity(host, path, seconds, port=port)
         super().__init__(timeout, CONNECTIVITY_CHECKS, probe, clock)
 
     def poll(self):
@@ -687,12 +778,13 @@ def monitor_status(status, pids=None, message=None):
 class NetworkMonitor:
     def __init__(self, config, controller, baseline, job, clock=time.monotonic,
                  process_reader=claude_pids, state_reader=system_proxy_state,
-                 port_check=local_proxy_alive, probe_factory=ExitProbe, state_writer=monitor_status,
+                 port_check=None, probe_factory=ExitProbe, state_writer=monitor_status,
                  firewall_checker=check_firewall, connectivity_factory=ConnectivityProbe,
                  event_writer=None):
         self.config, self.controller, self.baseline, self.job = config, controller, baseline, job
         self.clock, self.process_reader = clock, process_reader
-        self.state_reader, self.port_check = state_reader, port_check
+        self.state_reader = state_reader
+        self.port_check = port_check or (lambda: local_proxy_alive(proxy_port(config)))
         self.probe_factory, self.state_writer = probe_factory, state_writer
         self.firewall_checker = firewall_checker
         self.connectivity_factory = connectivity_factory
@@ -705,6 +797,8 @@ class NetworkMonitor:
         self.next_connectivity = None
         self.failed_connectivity_rounds = 0
         self.exit_degraded = False
+        self.last_runtime_ok = clock()
+        self.runtime_degraded = False
 
     def step(self):
         pids = self.process_reader()
@@ -721,12 +815,25 @@ class NetworkMonitor:
         if now >= self.next_runtime:
             self.firewall_checker()
             timeout = self.config["controller_timeout_seconds"]
-            runtime = self.controller.get("/configs", timeout=timeout)
-            proxies = self.controller.get("/proxies", timeout=timeout)["proxies"]
-            chain = validate_runtime(runtime, proxies, True)
-            if list(chain[0]) != self.baseline["chain"]:
-                raise GuardError("运行期间所选代理节点发生变化。")
-            self.next_runtime = self.clock() + self.config["runtime_check_interval_seconds"]
+            try:
+                runtime = self.controller.get("/configs", timeout=timeout)
+                proxies = self.controller.get("/proxies", timeout=timeout)["proxies"]
+                chain = validate_live_route(self.config, self.controller, runtime, proxies)
+            except ControllerUnavailable:
+                if not self.runtime_degraded:
+                    self.event_writer("controller-check-unavailable", "Clash 本地接口暂不可读，正在有限重试。")
+                self.runtime_degraded = True
+                if self.clock() - self.last_runtime_ok > 5:
+                    raise GuardError("Clash 路由核验超过 5 秒未更新，无法持续确认代理路线。")
+                self.next_runtime = self.clock() + self.config["watch_interval_seconds"]
+            else:
+                if list(chain[0]) != self.baseline["chain"]:
+                    raise GuardError("运行期间所选代理节点发生变化。")
+                if self.runtime_degraded:
+                    self.event_writer("controller-check-recovered", "Clash 路由核验已恢复，代理路线保持有效。")
+                self.runtime_degraded = False
+                self.last_runtime_ok = self.clock()
+                self.next_runtime = self.clock() + self.config["runtime_check_interval_seconds"]
         if self.probe is not None:
             try:
                 address = self.probe.poll()
@@ -769,10 +876,10 @@ class NetworkMonitor:
                     self.next_connectivity = self.clock() + self.config["upstream_retry_delay_seconds"]
         if (self.connectivity_probe is None and self.next_connectivity is not None
                 and self.clock() >= self.next_connectivity):
-            self.connectivity_probe = self.connectivity_factory(self.config["connectivity_timeout_seconds"])
+            self.connectivity_probe = self.connectivity_factory(self.config["connectivity_timeout_seconds"], port=proxy_port(self.config))
         if self.probe is None and self.clock() >= self.next_probe:
             self.probe = self.probe_factory(self.config["remote_timeout_seconds"],
-                                            expected_ip=self.baseline["exit_ip"])
+                                            expected_ip=self.baseline["exit_ip"], port=proxy_port(self.config))
         if self.clock() >= self.next_status:
             message = None
             if self.exit_degraded:
@@ -806,10 +913,10 @@ def preflight(config, controller, state_reader=system_proxy_state, ip_probe=prox
     validate_system_proxy(initial_system)
     runtime = controller.get("/configs")
     proxies = controller.get("/proxies")["proxies"]
-    chain = validate_runtime(runtime, proxies, config["require_tun"])
+    chain = validate_live_route(config, controller, runtime, proxies)
     # TCP connectivity here stays on loopback; the first Internet requests only
     # happen after global non-DIRECT routing is established.
-    exit_probe = ExitProbe(config["request_timeout_seconds"], probe=ip_probe)
+    exit_probe = ExitProbe(config["request_timeout_seconds"], probe=ip_probe, port=proxy_port(config))
     while True:
         address = exit_probe.poll()
         if address is not None:
@@ -822,13 +929,13 @@ def preflight(config, controller, state_reader=system_proxy_state, ip_probe=prox
     final_system = state_reader()
     validate_system_proxy(final_system)
     final_runtime = controller.get("/configs")
-    final_chain = validate_runtime(final_runtime, controller.get("/proxies")["proxies"], True)
+    final_chain = validate_live_route(config, controller, final_runtime, controller.get("/proxies")["proxies"])
     if final_chain != chain or final_system != initial_system:
         raise GuardError("检查期间代理设置或节点发生变化，拒绝启动。")
     if not network_only and running_check():
         raise GuardError("检查期间 Claude 已被其他入口启动，请先退出后重试。")
     return {"proxy": config["proxy_url"], "exit_ip": address, "chain": list(chain[0]),
-            "mode": "global", "tun": True}
+            "mode": final_runtime["mode"], "tun": True}
 
 
 def claude_binary(config):

@@ -275,7 +275,7 @@ class WatchdogTests(unittest.TestCase):
                                     probe_factory=probes or (lambda _, **kwargs: HealthyProbe()),
                                     state_writer=lambda status, pids, message=None: self.states.append((status, message)),
                                     firewall_checker=firewall or (lambda: True),
-                                    connectivity_factory=connectivity or (lambda _: StaticConnectivityProbe()),
+                                    connectivity_factory=connectivity or (lambda _, **kwargs: StaticConnectivityProbe()),
                                     event_writer=lambda status, message, **kwargs: self.events.append((status, kwargs)))
 
     def close(self):
@@ -301,7 +301,7 @@ class WatchdogTests(unittest.TestCase):
 
     def test_confirmed_upstream_failure_forces_close_after_two_rounds(self):
         monitor = self.monitor(probes=lambda _, **kwargs: FailedExitProbe(),
-                               connectivity=lambda _: StaticConnectivityProbe(False))
+                               connectivity=lambda _, **kwargs: StaticConnectivityProbe(False))
         self.assert_closed_on_fault(monitor)
         self.assertEqual(monitor.failed_connectivity_rounds, 2)
         self.assertGreaterEqual(self.clock, WATCH_CONFIG['upstream_retry_delay_seconds'])
@@ -319,7 +319,7 @@ class WatchdogTests(unittest.TestCase):
     def test_second_round_recovery_resets_failures_and_keeps_claude(self):
         rounds = iter([False, True])
         monitor = self.monitor(probes=lambda _, **kwargs: FailedExitProbe(),
-                               connectivity=lambda _: StaticConnectivityProbe(next(rounds)))
+                               connectivity=lambda _, **kwargs: StaticConnectivityProbe(next(rounds)))
         for _ in range(3):
             self.assertTrue(monitor.step())
         self.assertEqual(monitor.failed_connectivity_rounds, 1)
@@ -349,7 +349,7 @@ class WatchdogTests(unittest.TestCase):
             if broken[0]:
                 raise guard.GuardError('local proxy stopped')
         monitor = self.monitor(port=port, probes=lambda _, **kwargs: FailedExitProbe(),
-                               connectivity=lambda _: StaticConnectivityProbe(None))
+                               connectivity=lambda _, **kwargs: StaticConnectivityProbe(None))
         monitor.step()
         monitor.step()
         broken[0] = True
@@ -362,7 +362,7 @@ class WatchdogTests(unittest.TestCase):
             if broken[0]:
                 raise guard.GuardError('firewall disabled')
         monitor = self.monitor(firewall=firewall, probes=lambda _, **kwargs: FailedExitProbe(),
-                               connectivity=lambda _: StaticConnectivityProbe(None))
+                               connectivity=lambda _, **kwargs: StaticConnectivityProbe(None))
         monitor.step()
         monitor.step()
         self.clock = 1
@@ -373,7 +373,7 @@ class WatchdogTests(unittest.TestCase):
     def test_direct_mode_still_closes_during_remote_confirmation(self):
         controller = FakeController()
         monitor = self.monitor(controller=controller, probes=lambda _, **kwargs: FailedExitProbe(),
-                               connectivity=lambda _: StaticConnectivityProbe(None))
+                               connectivity=lambda _, **kwargs: StaticConnectivityProbe(None))
         monitor.step()
         monitor.step()
         self.clock = 1
@@ -406,6 +406,31 @@ class WatchdogTests(unittest.TestCase):
         def crashed():
             raise RuntimeError('unexpected monitor failure')
         self.assert_closed_on_fault(self.monitor(port=crashed))
+
+    def test_controller_transient_error_recovers_without_closing(self):
+        broken = [True]
+        class Controller(FakeController):
+            def get(self, *args, **kwargs):
+                if broken[0]:
+                    raise guard.ControllerUnavailable('temporary reload')
+                return super().get(*args, **kwargs)
+        monitor = self.monitor(controller=Controller())
+        self.assertTrue(monitor.step())
+        self.assertTrue(monitor.runtime_degraded)
+        broken[0] = False
+        self.clock = 0.5
+        self.assertTrue(monitor.step())
+        self.assertFalse(monitor.runtime_degraded)
+        self.assertFalse(self.job.terminated)
+
+    def test_controller_failures_do_not_extend_five_second_deadline(self):
+        class Controller(FakeController):
+            def get(self, *args, **kwargs):
+                raise guard.ControllerUnavailable('unavailable')
+        monitor = self.monitor(controller=Controller())
+        self.assert_closed_on_fault(monitor)
+        self.assertGreater(self.clock, 5)
+        self.assertLess(self.clock, 6)
 
     def test_normal_exit_does_not_force_kill(self):
         processes = iter([[123], []])
@@ -588,6 +613,97 @@ class WatchdogTests(unittest.TestCase):
                              root / 'app-2.1.0/claude.exe')
 
 
+class RuleRoutingTests(unittest.TestCase):
+    RULES = [{'type': 'InPort', 'payload': '17897', 'proxy': 'GLOBAL'},
+             {'type': 'ProcessPath', 'payload': 'C:\\Apps\\Claude\\claude.exe', 'proxy': 'GLOBAL'}]
+
+    def test_setup_preserves_other_routing_and_is_idempotent(self):
+        helper_spec = importlib.util.spec_from_file_location('rule_setup', source.parent / 'configure-rule-mode.py')
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        original = {'mode': 'rule', 'rules': ['GEOIP,CN,DIRECT', 'MATCH,PROXY'],
+                    'listeners': [{'name': 'other', 'port': 9000}],
+                    'proxies': [{'name': 'node', 'password': 'dummy-fixture'}]}
+        result = helper.guard_configuration(original, ['C:\\Apps\\Claude\\claude.exe'], 'PROXY')
+        self.assertEqual(result['rules'][:2], ['IN-PORT,17897,PROXY', 'PROCESS-PATH,C:\\Apps\\Claude\\claude.exe,PROXY'])
+        self.assertEqual(result['rules'][2:], original['rules'])
+        self.assertEqual(result['mode'], 'rule')
+        self.assertEqual(result['listeners'][-1]['proxy'], 'PROXY')
+        self.assertEqual(result['listeners'][-1]['listen'], '127.0.0.1')
+        self.assertEqual(result['proxies'], original['proxies'])
+        self.assertEqual(helper.guard_configuration(result, ['C:\\Apps\\Claude\\claude.exe'], 'PROXY'), result)
+
+    def test_setup_rejects_listener_collision_and_rule_injection(self):
+        helper_spec = importlib.util.spec_from_file_location('rule_setup', source.parent / 'configure-rule-mode.py')
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        with self.assertRaises(ValueError):
+            helper.guard_configuration({'listeners': [{'name': 'other', 'port': 17897}]}, ['C:\\Claude.exe'], 'PROXY')
+        with self.assertRaises(ValueError):
+            helper.guard_configuration({}, ['C:\\bad,path.exe'], 'PROXY')
+
+    def test_rule_mode_accepts_dedicated_forced_route(self):
+        chain = guard.validate_runtime(dict(RUNTIME, mode='rule'), PROXIES, rules=self.RULES, dedicated=True)
+        self.assertEqual(chain[0], ('GLOBAL', 'chosen'))
+
+    def test_rule_mode_rejects_any_direct_rule_ahead_of_guard_route(self):
+        rules = [{'type': 'Match', 'payload': '', 'proxy': 'DIRECT'}] + self.RULES
+        with self.assertRaises(guard.GuardError):
+            guard.validate_runtime(dict(RUNTIME, mode='rule'), PROXIES, rules=rules, dedicated=True)
+
+    def test_rule_mode_rejects_wrong_inbound_or_target(self):
+        for field, value in [('payload', '7897'), ('proxy', 'DIRECT'), ('type', 'Domain')]:
+            rules = copy.deepcopy(self.RULES)
+            rules[0][field] = value
+            with self.assertRaises(guard.GuardError):
+                guard.validate_runtime(dict(RUNTIME, mode='rule'), PROXIES, rules=rules, dedicated=True)
+
+    def test_direct_mode_remains_fatal_even_with_guard_rules(self):
+        with self.assertRaises(guard.GuardError):
+            guard.validate_runtime(dict(RUNTIME, mode='direct'), PROXIES, rules=self.RULES, dedicated=True)
+
+    def test_live_route_rejects_foreign_listener_owner_and_missing_process_route(self):
+        class Controller:
+            server_pid = 123
+            def get(self, path, **kwargs):
+                if path == '/connections':
+                    return {'connections': []}
+                return {'rules': copy.deepcopy(RuleRoutingTests.RULES)}
+        config = dict(CONFIG, proxy_url='http://127.0.0.1:17897')
+        manifest = json.dumps({'programs': ['C:\\Apps\\Claude\\claude.exe']})
+        with mock.patch.object(guard.Path, 'read_text', return_value=manifest), mock.patch.object(guard, 'listener_owned_by', return_value=True):
+            self.assertEqual(guard.validate_live_route(config, Controller(), dict(RUNTIME, mode='rule'), PROXIES)[0], ('GLOBAL', 'chosen'))
+        with mock.patch.object(guard.Path, 'read_text', return_value=manifest), mock.patch.object(guard, 'listener_owned_by', return_value=False):
+            with self.assertRaises(guard.GuardError):
+                guard.validate_live_route(config, Controller(), dict(RUNTIME, mode='rule'), PROXIES)
+        wrong = json.dumps({'programs': ['C:\\Apps\\Claude\\other.exe']})
+        with mock.patch.object(guard.Path, 'read_text', return_value=wrong), mock.patch.object(guard, 'listener_owned_by', return_value=True):
+            with self.assertRaises(guard.GuardError):
+                guard.validate_live_route(config, Controller(), dict(RUNTIME, mode='rule'), PROXIES)
+
+    def test_exit_probe_and_https_recheck_use_the_dedicated_port(self):
+        with mock.patch.object(guard.http.client, 'HTTPSConnection') as connection:
+            connection.return_value.getresponse.return_value.status = 200
+            connection.return_value.getresponse.return_value.read.return_value = b'8.8.8.8'
+            self.assertEqual(guard.proxy_exit_ip('api.ipify.org', '/', 5, port=17897), '8.8.8.8')
+            self.assertEqual(connection.call_args.args, ('127.0.0.1', 17897))
+            connection.return_value.getresponse.return_value.status = 204
+            self.assertTrue(guard.proxy_connectivity('www.gstatic.com', '/generate_204', 5, port=17897))
+            self.assertEqual(connection.call_args.args, ('127.0.0.1', 17897))
+
+    def test_actual_direct_or_different_outbound_route_is_rejected(self):
+        class Controller:
+            server_pid = 123
+            def get(self, path, **kwargs):
+                if path == '/connections':
+                    return {'connections': [{'metadata': {'inboundPort': '17897'}, 'chains': route}]}
+                return {'rules': copy.deepcopy(RuleRoutingTests.RULES)}
+        config = dict(CONFIG, proxy_url='http://127.0.0.1:17897')
+        manifest = json.dumps({'programs': ['C:\\Apps\\Claude\\claude.exe']})
+        for route in [['DIRECT'], ['another-node', 'GLOBAL']]:
+            with mock.patch.object(guard.Path, 'read_text', return_value=manifest), mock.patch.object(guard, 'listener_owned_by', return_value=True):
+                with self.assertRaises(guard.GuardError):
+                    guard.validate_live_route(config, Controller(), dict(RUNTIME, mode='rule'), PROXIES)
 class FirewallWatcherTests(unittest.TestCase):
     def watcher(self):
         self.clock = 0
