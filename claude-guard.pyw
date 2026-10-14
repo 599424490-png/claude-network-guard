@@ -80,7 +80,7 @@ def load_config():
     return config
 
 
-def bounded_call(fn, seconds=6):
+def bounded_call(fn, seconds=6, on_start=None, on_timeout=None):
     result = queue.Queue(maxsize=1)
 
     def worker():
@@ -89,11 +89,17 @@ def bounded_call(fn, seconds=6):
         except Exception as exc:
             result.put((False, exc))
 
-    threading.Thread(target=worker, daemon=True).start()
+    thread = threading.Thread(target=worker, daemon=True)
+    if on_start:
+        on_start(thread)
+    thread.start()
     try:
         ok, value = result.get(timeout=seconds)
     except queue.Empty:
+        if on_timeout:
+            on_timeout(thread)
         raise ControllerUnavailable("读取 Clash 运行状态超时。") from None
+    thread.join(0.05)
     if not ok:
         categories = []
         cause = value
@@ -116,6 +122,7 @@ class Controller:
             raise GuardError("未找到唯一的 Clash 代理内核。请先启动 Clash Verge。")
         self.pipe = pipes[0]
         self.server_pid = None
+        self.pending_worker = None
         self.secret = ""
         try:
             import yaml
@@ -131,13 +138,23 @@ class Controller:
     def get(self, path, timeout=6):
         if path not in {"/configs", "/proxies", "/rules", "/connections"}:
             raise GuardError("不允许的代理控制器请求。")
+        pending = getattr(self, "pending_worker", None)
+        if pending is not None and pending.is_alive():
+            raise ControllerUnavailable("上一轮本地接口请求仍在取消中。")
 
         deadline = time.monotonic() + timeout
+        cancelled = threading.Event()
+        phase = ["open"]
+
+        def ensure_active():
+            if cancelled.is_set() or time.monotonic() >= deadline:
+                raise ControllerUnavailable("Clash 本地接口请求已过期。")
 
         def request():
             class PipeSocket:
                 def __init__(self, pipe):
                     while True:
+                        ensure_active()
                         try:
                             self.file = open(pipe, "r+b", buffering=0)
                             break
@@ -159,6 +176,7 @@ class Controller:
             sock = PipeSocket(self.pipe)
             response = None
             try:
+                ensure_active()
                 if hasattr(self, "server_pid"):
                     owner = wintypes.DWORD()
                     handle = msvcrt.get_osfhandle(sock.file.fileno())
@@ -170,16 +188,21 @@ class Controller:
                     headers += f"Authorization: Bearer {self.secret}\r\n"
                 request_bytes = (headers + "\r\n").encode("utf-8")
                 written = 0
+                phase[0] = "write"
                 while written < len(request_bytes):
+                    ensure_active()
                     size = sock.file.write(request_bytes[written:])
                     if not size:
                         raise OSError("Named pipe write failed")
                     written += size
                 response = http.client.HTTPResponse(sock)
+                phase[0] = "headers"
                 response.begin()
                 if response.status != 200:
                     raise GuardError("Clash 控制器拒绝查询。")
+                phase[0] = "body"
                 body = response.read(4 * 1024 * 1024 + 1)
+                ensure_active()
                 if len(body) > 4 * 1024 * 1024:
                     raise GuardError("Clash 控制器响应过大。")
                 return json.loads(body)
@@ -190,6 +213,7 @@ class Controller:
 
         def retry_request():
             for attempt in range(3):
+                ensure_active()
                 try:
                     return request()
                 except (OSError, ValueError, http.client.HTTPException):
@@ -197,7 +221,22 @@ class Controller:
                         raise
                     time.sleep(0.02)
 
-        return bounded_call(retry_request, timeout)
+        def cancel(thread):
+            cancelled.set()
+            # Cancel a blocking ReadFile/WriteFile instead of leaving one
+            # additional pipe/thread alive after every timeout.
+            handle = KERNEL.OpenThread(0x0001, False, thread.native_id)
+            if handle:
+                try:
+                    KERNEL.CancelSynchronousIo(handle)
+                finally:
+                    KERNEL.CloseHandle(handle)
+            thread.join(0.1)
+            record("controller-query-timeout", "本地接口请求超时，已请求取消该次管道读取。",
+                   diagnostics=[{"endpoint": path, "phase": phase[0], "worker_pending": thread.is_alive()}])
+
+        return bounded_call(retry_request, timeout,
+                            on_start=lambda thread: setattr(self, "pending_worker", thread), on_timeout=cancel)
 
 
 def system_proxy_state():
@@ -351,6 +390,10 @@ def proxy_connectivity(host, path, timeout, port=7897):
 KERNEL = ctypes.WinDLL("kernel32", use_last_error=True)
 KERNEL.CloseHandle.argtypes = [wintypes.HANDLE]
 KERNEL.CloseHandle.restype = wintypes.BOOL
+KERNEL.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+KERNEL.OpenThread.restype = wintypes.HANDLE
+KERNEL.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+KERNEL.CancelSynchronousIo.restype = wintypes.BOOL
 KERNEL.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 KERNEL.GetNamedPipeServerProcessId.restype = wintypes.BOOL
 
@@ -517,13 +560,15 @@ class ProcessJob:
             self.handle = None
 
 
-def check_firewall():
+def check_firewall(raw=False):
     try:
         executable = Path(os.environ["WINDIR"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         result = subprocess.run([str(executable), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                  "-File", str(ROOT / "check-firewall.ps1")],
                                 capture_output=True, timeout=4, creationflags=subprocess.CREATE_NO_WINDOW)
         data = json.loads(result.stdout.decode("utf-8-sig"))
+        if raw and result.returncode in (0, 1) and isinstance(data.get("ok"), bool):
+            return data
         if result.returncode != 0 or data.get("ok") is not True:
             raise GuardError("防火墙直连限制尚未生效或已失效。请完成管理员安装后重试。")
         return data
@@ -532,16 +577,21 @@ def check_firewall():
 
 
 class FirewallWatcher:
-    def __init__(self, checker=None, clock=time.monotonic, event_writer=None):
+    def __init__(self, checker=None, clock=time.monotonic, event_writer=None, recovery_checker=None):
         self.checker, self.clock = checker, clock
         self.event_writer = event_writer or record
         self.ready = threading.Event()
         self.stop_event = threading.Event()
+        self.restart_event = threading.Event()
         self.lock = threading.Lock()
+        self.recovery_lock = threading.Lock()
         self.last_result = self.last_time = None
         self.process = None
         self.query_unavailable = False
         self.policy_fault = None
+        self.last_phase = "starting"
+        self.verified_once = False
+        self.recovery_checker = recovery_checker or (lambda: check_firewall(raw=True))
         threading.Thread(target=self.worker, daemon=True).start()
 
     def publish(self, result):
@@ -550,9 +600,17 @@ class FirewallWatcher:
         self.ready.set()
 
     def accept(self, data):
+        if data.get("kind") == "progress":
+            phase = data.get("phase")
+            if phase not in {"profiles", "self-test", "rules", "programs", "validate"}:
+                raise ValueError("Invalid firewall verification phase")
+            self.last_phase = phase  # A heartbeat is not a successful policy check.
+            return
         if self.policy_fault is not None:
             return  # A detected policy failure stays fatal until relaunch.
         if data.get("ok") is True:
+            self.verified_once = True
+            self.last_phase = "complete"
             if self.query_unavailable:
                 self.event_writer("firewall-check-recovered", "防火墙核验工具已恢复，规则仍有效。")
             self.query_unavailable = False
@@ -594,49 +652,86 @@ class FirewallWatcher:
                     self.publish((False, exc))
                 self.stop_event.wait(1)
             return
-        process = None
-        try:
-            executable = Path(os.environ["WINDIR"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-            process = subprocess.Popen([str(executable), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                        "-File", str(ROOT / "check-firewall.ps1"), "-Watch"],
-                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                       creationflags=subprocess.CREATE_NO_WINDOW)
-            self.process = process
-            while not self.stop_event.is_set():
-                line = process.stdout.readline(16385)
-                if not line or len(line) > 16384:
-                    raise GuardError("防火墙核验进程已退出或返回无效响应。")
-                self.accept(json.loads(line.decode("utf-8-sig")))
-        except Exception as exc:
-            if not self.stop_event.is_set():
-                self.event_writer("firewall-checker-stopped", "防火墙核验进程异常结束。",
-                                  diagnostics=[{"error_category": type(exc).__name__}])
-                self.publish((False, GuardError("防火墙核验进程异常，无法持续确认保护。")))
-        finally:
-            if process is not None:
-                if process.poll() is None:
-                    process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                if process.stdout:
-                    process.stdout.close()
+        while not self.stop_event.is_set():
+            process = None
+            self.restart_event.clear()
+            try:
+                executable = Path(os.environ["WINDIR"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+                process = subprocess.Popen([str(executable), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                            "-File", str(ROOT / "check-firewall.ps1"), "-Watch"],
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                self.process = process
+                while not self.stop_event.is_set() and not self.restart_event.is_set():
+                    line = process.stdout.readline(16385)
+                    if self.stop_event.is_set() or self.restart_event.is_set():
+                        break
+                    if not line or len(line) > 16384:
+                        raise GuardError("防火墙核验进程已退出或返回无效响应。")
+                    self.accept(json.loads(line.decode("utf-8-sig")))
+            except Exception as exc:
+                if not self.stop_event.is_set() and not self.restart_event.is_set():
+                    self.event_writer("firewall-checker-stopped", "防火墙核验进程异常结束。",
+                                      diagnostics=[{"error_category": type(exc).__name__}])
+                    self.publish((False, GuardError("防火墙核验进程异常，无法持续确认保护。")))
+                    # Only a successful independent recheck may authorize restart.
+                    if not self.verified_once or not self.restart_event.wait(5):
+                        return
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    if process.stdout:
+                        process.stdout.close()
 
     def check(self):
         if not self.ready.wait(10):
             raise GuardError("防火墙核验进程未能及时启动。")
         with self.lock:
             result, timestamp = self.last_result, self.last_time
-        if not result or not result[0]:
+        if self.policy_fault is not None:
+            raise self.policy_fault
+        if result and result[0] and self.clock() - timestamp <= 5:
+            return result[1]
+        if not self.verified_once:
             message = str(result[1]) if result and isinstance(result[1], GuardError) else "防火墙核验失败。"
             raise GuardError(message) from (result[1] if result else None)
-        if self.clock() - timestamp > 5:
-            raise GuardError("防火墙核验结果已超过 5 秒未更新，无法持续确认保护。")
-        return result[1]
+        with self.recovery_lock:
+            with self.lock:
+                result, timestamp = self.last_result, self.last_time
+            if self.policy_fault is not None:
+                raise self.policy_fault
+            if result and result[0] and self.clock() - timestamp <= 5:
+                return result[1]
+            process = self.process
+            self.event_writer("firewall-verifier-rechecking", "常驻核验器未及时回报，独立复核实际防火墙规则。",
+                              diagnostics=[{"phase": self.last_phase,
+                                            "age_seconds": round(self.clock() - timestamp, 2),
+                                            "checker_pid": getattr(process, "pid", None)}])
+            failure = None
+            try:
+                self.accept(self.recovery_checker())
+            except Exception as exc:
+                failure = exc
+            if self.policy_fault is not None:
+                raise self.policy_fault
+            with self.lock:
+                result, timestamp = self.last_result, self.last_time
+            if not result or not result[0] or self.clock() - timestamp > 5:
+                raise GuardError("防火墙核验超过 5 秒未更新，独立复核也未通过，无法持续确认保护。") from failure
+            self.restart_event.set()
+            if process is not None and process.poll() is None:
+                process.terminate()  # Only this watcher's checker; no firewall changes.
+            self.event_writer("firewall-verifier-recovered", "独立核验通过，已恢复常驻检查；直连限制仍有效。")
+            return result[1]
 
     def close(self):
         self.stop_event.set()
+        self.restart_event.set()
         process = self.process
         if process is not None and process.poll() is None:
             process.terminate()
@@ -775,6 +870,26 @@ def monitor_status(status, pids=None, message=None):
         pass
 
 
+class RouteRecheck:
+    """One fresh route snapshot with a shared deadline for all API reads."""
+    def __init__(self, controller, seconds, clock=time.monotonic):
+        self.controller, self.clock = controller, clock
+        self.deadline = clock() + seconds
+
+    @property
+    def server_pid(self):
+        return self.controller.server_pid
+
+    def get(self, path, **kwargs):
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            raise ControllerUnavailable("独立路由复核已超时。")
+        result = self.controller.get(path, timeout=remaining)
+        if self.clock() >= self.deadline:
+            raise ControllerUnavailable("独立路由复核已超时。")
+        return result
+
+
 class NetworkMonitor:
     def __init__(self, config, controller, baseline, job, clock=time.monotonic,
                  process_reader=claude_pids, state_reader=system_proxy_state,
@@ -800,6 +915,12 @@ class NetworkMonitor:
         self.last_runtime_ok = clock()
         self.runtime_degraded = False
 
+    def read_route(self, controller):
+        timeout = self.config["controller_timeout_seconds"]
+        runtime = controller.get("/configs", timeout=timeout)
+        proxies = controller.get("/proxies", timeout=timeout)["proxies"]
+        return validate_live_route(self.config, controller, runtime, proxies)
+
     def step(self):
         pids = self.process_reader()
         if pids:
@@ -814,19 +935,24 @@ class NetworkMonitor:
         now = self.clock()
         if now >= self.next_runtime:
             self.firewall_checker()
-            timeout = self.config["controller_timeout_seconds"]
+            chain = None
             try:
-                runtime = self.controller.get("/configs", timeout=timeout)
-                proxies = self.controller.get("/proxies", timeout=timeout)["proxies"]
-                chain = validate_live_route(self.config, self.controller, runtime, proxies)
+                chain = self.read_route(self.controller)
             except ControllerUnavailable:
                 if not self.runtime_degraded:
                     self.event_writer("controller-check-unavailable", "Clash 本地接口暂不可读，正在有限重试。")
                 self.runtime_degraded = True
                 if self.clock() - self.last_runtime_ok > 5:
-                    raise GuardError("Clash 路由核验超过 5 秒未更新，无法持续确认代理路线。")
+                    self.event_writer("controller-route-rechecking", "路由核验未及时回报，重新读取完整代理路线。",
+                                      diagnostics=[{"age_seconds": round(self.clock() - self.last_runtime_ok, 2)}])
+                    self.firewall_checker()
+                    self.port_check()
+                    try:
+                        chain = self.read_route(RouteRecheck(self.controller, 4, self.clock))
+                    except ControllerUnavailable as exc:
+                        raise GuardError("Clash 路由核验超过 5 秒未更新，独立复核也未通过，无法确认代理路线。") from exc
                 self.next_runtime = self.clock() + self.config["watch_interval_seconds"]
-            else:
+            if chain is not None:
                 if list(chain[0]) != self.baseline["chain"]:
                     raise GuardError("运行期间所选代理节点发生变化。")
                 if self.runtime_degraded:

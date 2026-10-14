@@ -9,7 +9,20 @@ function Get-GuardPrograms {
     $guardPrograms = @()
     foreach ($guardProgramRoot in $guardProgramRoots) {
         if (Test-Path -LiteralPath $guardProgramRoot) {
-            $guardPrograms += @(Get-ChildItem -LiteralPath $guardProgramRoot -File -Filter '*.exe' -Recurse -ErrorAction Stop | Select-Object -ExpandProperty FullName)
+            # Native enumeration avoids constructing a FileInfo/PowerShell
+            # pipeline for every file in multiple full app versions.
+            $guardDirectories = [Collections.Generic.Stack[string]]::new()
+            $guardDirectories.Push($guardProgramRoot)
+            while ($guardDirectories.Count) {
+                $guardDirectory = $guardDirectories.Pop()
+                $guardPrograms += @([IO.Directory]::EnumerateFiles($guardDirectory, '*.exe', [IO.SearchOption]::TopDirectoryOnly))
+                foreach ($guardChild in [IO.Directory]::EnumerateDirectories($guardDirectory)) {
+                    # Match Get-ChildItem's default: do not follow child links.
+                    if (-not ([IO.File]::GetAttributes($guardChild) -band [IO.FileAttributes]::ReparsePoint)) {
+                        $guardDirectories.Push($guardChild)
+                    }
+                }
+            }
         }
     }
     if ($guardPrograms.Count -eq 0) { throw 'No Claude executables found' }

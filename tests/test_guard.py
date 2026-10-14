@@ -99,6 +99,46 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             guard.validate_runtime(data, PROXIES)
 
+    def test_pending_pipe_request_does_not_spawn_more_workers(self):
+        controller = self.controller()
+        controller.pending_worker = mock.Mock()
+        controller.pending_worker.is_alive.return_value = True
+        with mock.patch.object(guard, 'bounded_call') as worker:
+            with self.assertRaises(guard.ControllerUnavailable):
+                controller.get('/configs', timeout=0.2)
+        worker.assert_not_called()
+
+    def test_timeout_cancels_real_blocking_named_pipe_read(self):
+        api = guard.ctypes.WinDLL('kernel32', use_last_error=True)
+        api.CreateNamedPipeW.argtypes = [guard.wintypes.LPCWSTR, guard.wintypes.DWORD,
+            guard.wintypes.DWORD, guard.wintypes.DWORD, guard.wintypes.DWORD,
+            guard.wintypes.DWORD, guard.wintypes.DWORD, guard.ctypes.c_void_p]
+        api.CreateNamedPipeW.restype = guard.wintypes.HANDLE
+        api.ConnectNamedPipe.argtypes = [guard.wintypes.HANDLE, guard.ctypes.c_void_p]
+        api.DisconnectNamedPipe.argtypes = [guard.wintypes.HANDLE]
+        name = r'\\.\pipe\ClaudeGuardCancellationTest-' + str(guard.time.monotonic_ns())
+        handle = api.CreateNamedPipeW(name, 3, 0, 1, 4096, 4096, 0, None)
+        self.assertNotEqual(handle, guard.ctypes.c_void_p(-1).value)
+        release = threading.Event()
+        def server():
+            api.ConnectNamedPipe(handle, None)
+            release.wait(5)  # Accept the client but never send HTTP headers.
+        thread = threading.Thread(target=server, daemon=True)
+        thread.start()
+        controller = self.controller()
+        controller.pipe = name
+        try:
+            with mock.patch.object(guard, 'record'):
+                with self.assertRaises(guard.ControllerUnavailable):
+                    controller.get('/configs', timeout=0.15)
+            controller.pending_worker.join(1)
+            self.assertFalse(controller.pending_worker.is_alive(), 'Timed-out pipe reader must be cancelled')
+        finally:
+            release.set()
+            thread.join(2)
+            api.DisconnectNamedPipe(handle)
+            guard.KERNEL.CloseHandle(handle)
+
     def check(self, controller=None, state=None, probe=None, running=None, config=None):
         return guard.preflight(config or CONFIG, controller or FakeController(),
                                state_reader=state or (lambda: copy.deepcopy(SYSTEM)),
@@ -432,6 +472,42 @@ class WatchdogTests(unittest.TestCase):
         self.assertGreater(self.clock, 5)
         self.assertLess(self.clock, 6)
 
+    def test_stale_route_recovers_only_after_full_fresh_validation(self):
+        calls = []
+        class Controller(FakeController):
+            def get(self, path, **kwargs):
+                calls.append((path, kwargs['timeout']))
+                if kwargs['timeout'] <= 1:
+                    raise guard.ControllerUnavailable('short polling deadline')
+                return super().get(path, **kwargs)
+        monitor = self.monitor(controller=Controller())
+        self.clock = 6
+        self.assertTrue(monitor.step())
+        self.assertFalse(self.job.terminated)
+        self.assertFalse(monitor.runtime_degraded)
+        self.assertEqual([call[0] for call in calls], ['/configs', '/configs', '/proxies'])
+
+    def test_fresh_route_recheck_still_rejects_direct_mode(self):
+        class Controller(FakeController):
+            def get(self, path, **kwargs):
+                if kwargs['timeout'] <= 1:
+                    raise guard.ControllerUnavailable('short polling deadline')
+                return super().get(path, **kwargs)
+        monitor = self.monitor(controller=Controller(runtime=dict(RUNTIME, mode='direct')))
+        self.clock = 6
+        self.assert_closed_on_fault(monitor)
+
+    def test_route_recheck_has_one_deadline_across_multiple_reads(self):
+        self.clock = 0
+        class SlowController(FakeController):
+            def get(inner, *args, **kwargs):
+                self.clock += 2.1
+                return super().get(*args, **kwargs)
+        recheck = guard.RouteRecheck(SlowController(), 4, clock=lambda: self.clock)
+        recheck.get('/configs')
+        with self.assertRaises(guard.ControllerUnavailable):
+            recheck.get('/proxies')
+
     def test_normal_exit_does_not_force_kill(self):
         processes = iter([[123], []])
         monitor = self.monitor(processes=lambda: next(processes))
@@ -728,12 +804,113 @@ class RuleRoutingTests(unittest.TestCase):
                 with self.assertRaises(guard.GuardError):
                     guard.validate_live_route(config, Controller(), dict(RUNTIME, mode='rule'), PROXIES)
 class FirewallWatcherTests(unittest.TestCase):
-    def watcher(self):
+    def watcher(self, recovery=None):
         self.clock = 0
         self.events = []
+        def unavailable():
+            raise guard.GuardError('independent verification unavailable')
         with mock.patch.object(guard.threading, 'Thread'):
             return guard.FirewallWatcher(clock=lambda: self.clock,
+                recovery_checker=recovery or unavailable,
                 event_writer=lambda status, message, **kwargs: self.events.append(status))
+
+    def test_stalled_verifier_is_independently_rechecked_before_closing(self):
+        recovery = mock.Mock(return_value={'ok': True, 'protected_programs': 21})
+        watcher = self.watcher(recovery)
+        watcher.accept({'ok': True})
+        watcher.process = mock.Mock()
+        watcher.process.poll.return_value = None
+        self.clock = 6
+        self.assertTrue(watcher.check()['ok'])
+        recovery.assert_called_once()
+        watcher.process.terminate.assert_called_once()
+        self.assertEqual(watcher.last_time, 6)
+        self.assertIn('firewall-verifier-recovered', self.events)
+
+    def test_recovery_does_not_accept_missing_or_modified_rules(self):
+        for code in ['rule_missing', 'rule_invalid', 'profile_disabled']:
+            watcher = self.watcher(lambda: {'ok': False, 'code': code})
+            watcher.accept({'ok': True})
+            self.clock = 6
+            with self.assertRaises(guard.GuardError):
+                watcher.check()
+            watcher.accept({'ok': True})
+            with self.assertRaises(guard.GuardError):
+                watcher.check()
+
+    def test_fault_arriving_during_recovery_cannot_be_overwritten(self):
+        def recovery():
+            watcher.accept({'ok': False, 'code': 'rule_invalid'})
+            return {'ok': True}
+        watcher = self.watcher(recovery)
+        watcher.accept({'ok': True})
+        self.clock = 6
+        with self.assertRaises(guard.GuardError):
+            watcher.check()
+
+    def test_progress_heartbeats_do_not_extend_successful_verification(self):
+        watcher = self.watcher()
+        watcher.accept({'ok': True})
+        for second in range(1, 7):
+            self.clock = second
+            watcher.accept({'kind': 'progress', 'phase': 'rules'})
+        self.assertEqual(watcher.last_time, 0)
+        with self.assertRaises(guard.GuardError):
+            watcher.check()
+
+    def test_recovery_query_exception_cannot_extend_freshness(self):
+        watcher = self.watcher(lambda: {'ok': False, 'code': 'checker_exception'})
+        watcher.accept({'ok': True})
+        self.clock = 6
+        with self.assertRaises(guard.GuardError):
+            watcher.check()
+        self.assertEqual(watcher.last_time, 0)
+
+    def test_healthy_recheck_replaces_only_the_suspended_checker_process(self):
+        native = guard.ctypes.WinDLL('ntdll')
+        native.NtSuspendProcess.argtypes = [guard.wintypes.HANDLE]
+        native.NtSuspendProcess.restype = guard.wintypes.LONG
+        offset = [0]
+        events = []
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(guard, 'ROOT', Path(folder)):
+            # A protocol fixture, not the real firewall verifier or proxy.
+            (Path(folder) / 'check-firewall.ps1').write_text(
+                'param([switch]$Watch)\nwhile ($true) { [Console]::WriteLine(\'{"ok":true}\'); '
+                '[Console]::Out.Flush(); Start-Sleep -Milliseconds 100 }\n', encoding='utf-8')
+            watcher = guard.FirewallWatcher(clock=lambda: guard.time.monotonic() + offset[0],
+                recovery_checker=lambda: {'ok': True},
+                event_writer=lambda status, *args, **kwargs: events.append(status))
+            original = None
+            try:
+                watcher.check()
+                original = watcher.process
+                handle = guard.KERNEL.OpenProcess(0x0800, False, original.pid)
+                self.assertTrue(handle)
+                try:
+                    self.assertEqual(native.NtSuspendProcess(handle), 0)
+                finally:
+                    guard.KERNEL.CloseHandle(handle)
+                # Let any result already in the pipe drain before expiry.
+                guard.time.sleep(0.1)
+                offset[0] = 6
+                self.assertTrue(watcher.check()['ok'])
+                deadline = guard.time.monotonic() + 4
+                while guard.time.monotonic() < deadline:
+                    if watcher.process is not original and watcher.last_phase == 'complete' and not watcher.restart_event.is_set():
+                        break
+                    guard.time.sleep(0.05)
+                self.assertIsNot(watcher.process, original)
+                self.assertIsNotNone(original.poll())
+                self.assertTrue(watcher.check()['ok'])
+                self.assertIn('firewall-verifier-recovered', events)
+            finally:
+                watcher.close()
+                if original and original.poll() is None:
+                    original.kill()
+                if original:
+                    original.wait(timeout=3)
+                if watcher.process and watcher.process is not original:
+                    watcher.process.wait(timeout=3)
 
     def test_transient_query_error_does_not_override_recent_verified_rules(self):
         watcher = self.watcher()
