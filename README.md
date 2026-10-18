@@ -2,6 +2,10 @@
 
 A Windows launcher and firewall guard for Claude Desktop with Clash Verge / Mihomo. It checks the proxy before launch, blocks non-loopback connections for covered Claude executables, and closes Claude when protection fails.
 
+运行中通过 Windows 作业对象读取所属进程树，复用小缓冲区，不再反复创建全系统进程快照。子进程由作业自动纳入保护；系统资源暂缺导致的作业清单读取失败会继续保留已有作业、防火墙和路由保护。作业句柄失效、明确的路由违规或防火墙规则故障仍会终止运行。关闭时直接终止所属作业，清理失败不会覆盖最初错误原因。系统提交内存耗尽仍可能导致保护器或客户端退出，需要同时控制造成内存峰值的任务。
+
+本机配置可设置 `runtime_remote_probes: false` 停止运行中的公网 IP 和连通性探测；启动前核验仍保留。省略此项时保持原有运行中探测行为。
+
 用于 Windows 的 Claude 桌面端网络保护器。适合希望 Claude 始终通过本机 Clash 代理联网、避免误关代理或切换路由模式后程序继续运行的用户。
 
 ## 它有什么作用

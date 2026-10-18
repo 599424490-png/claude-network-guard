@@ -36,6 +36,15 @@ class GuardError(RuntimeError):
     pass
 
 
+class ProcessQueryUnavailable(GuardError):
+    def __init__(self, message, windows_error):
+        super().__init__(f"{message}（Windows 错误 {windows_error}）")
+        self.windows_error = windows_error
+
+
+PROCESS_RESOURCE_ERRORS = {8, 14, 24, 299, 1450, 1453, 1454, 1455, 1816}
+
+
 class ProbeUnavailable(GuardError):
     """A query failure is not evidence of direct routing or an upstream outage."""
     def __init__(self, message, diagnostics=None):
@@ -443,20 +452,28 @@ for function in (KERNEL.Process32FirstW, KERNEL.Process32NextW):
 
 
 def claude_pids():
-    snapshot = KERNEL.CreateToolhelp32Snapshot(2, 0)
-    if snapshot == ctypes.c_void_p(-1).value:
-        raise GuardError("无法读取 Claude 进程状态。")
+    # Global discovery is needed only before launch, never for runtime polling.
+    for attempt in range(3):
+        snapshot = KERNEL.CreateToolhelp32Snapshot(2, 0)
+        if snapshot != ctypes.c_void_p(-1).value:
+            break
+        error = ctypes.get_last_error()
+        if error not in PROCESS_RESOURCE_ERRORS or attempt == 2:
+            raise ProcessQueryUnavailable("无法读取 Claude 进程状态。", error)
+        time.sleep(0.05)
     try:
         entry = ProcessEntry()
         entry.dwSize = ctypes.sizeof(entry)
         found = []
         ok = KERNEL.Process32FirstW(snapshot, ctypes.byref(entry))
         if not ok and ctypes.get_last_error() != 18:
-            raise GuardError("无法枚举 Claude 进程。")
+            raise ProcessQueryUnavailable("无法枚举 Claude 进程。", ctypes.get_last_error())
         while ok:
             if entry.szExeFile.lower() == "claude.exe":
                 found.append(entry.th32ProcessID)
             ok = KERNEL.Process32NextW(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:
+            raise ProcessQueryUnavailable("Claude 进程清单读取中断。", ctypes.get_last_error())
         return found
     finally:
         KERNEL.CloseHandle(snapshot)
@@ -498,6 +515,11 @@ KERNEL.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
 KERNEL.AssignProcessToJobObject.restype = wintypes.BOOL
 KERNEL.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
 KERNEL.TerminateJobObject.restype = wintypes.BOOL
+KERNEL.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+KERNEL.QueryInformationJobObject.restype = wintypes.BOOL
+KERNEL.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+KERNEL.GetExitCodeProcess.restype = wintypes.BOOL
 KERNEL.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 KERNEL.CreateMutexW.restype = wintypes.HANDLE
 
@@ -519,9 +541,19 @@ class MonitorMutex:
             self.handle = None
 
 
+class BasicJobAccounting(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_longlong) for name in
+                ("TotalUserTime", "TotalKernelTime", "ThisPeriodTotalUserTime", "ThisPeriodTotalKernelTime")] + [
+                (name, wintypes.DWORD) for name in
+                ("TotalPageFaultCount", "TotalProcesses", "ActiveProcesses", "TotalTerminatedProcesses")]
+
+
 class ProcessJob:
     """Windows kills assigned processes when the guard's last job handle closes."""
     def __init__(self):
+        # Reuse small buffers rather than allocate a system-wide snapshot each tick.
+        self._pid_buffer = ctypes.create_string_buffer(8 + 1024 * ctypes.sizeof(ctypes.c_size_t))
+        self._accounting = BasicJobAccounting()
         self.handle = KERNEL.CreateJobObjectW(None, None)
         if not self.handle:
             raise GuardError("无法创建 Claude 进程保护。")
@@ -544,7 +576,8 @@ class ProcessJob:
                     raise GuardError("无法核验 Claude 进程保护。")
                 if not assigned.value and not KERNEL.AssignProcessToJobObject(self.handle, process):
                     # A process can finish naturally between enumeration and assignment.
-                    if pid not in claude_pids():
+                    exit_code = wintypes.DWORD()
+                    if KERNEL.GetExitCodeProcess(process, ctypes.byref(exit_code)) and exit_code.value != 259:
                         continue
                     raise GuardError("无法给 Claude 绑定后台保护。")
             finally:
@@ -552,7 +585,40 @@ class ProcessJob:
 
     def terminate(self):
         if self.handle:
-            KERNEL.TerminateJobObject(self.handle, 1)
+            return bool(KERNEL.TerminateJobObject(self.handle, 1))
+        return True
+
+    def pids(self):
+        for _ in range(4):
+            returned = wintypes.DWORD()
+            if KERNEL.QueryInformationJobObject(self.handle, 3, self._pid_buffer,
+                                               len(self._pid_buffer), ctypes.byref(returned)):
+                count = wintypes.DWORD.from_buffer(self._pid_buffer, 4).value
+                capacity = (len(self._pid_buffer) - 8) // ctypes.sizeof(ctypes.c_size_t)
+                if count > capacity:
+                    raise GuardError("Claude 作业返回了无效的进程清单。")
+                values = (ctypes.c_size_t * count).from_buffer(self._pid_buffer, 8)
+                return list(values)
+            error = ctypes.get_last_error()
+            if error != 234:  # ERROR_MORE_DATA: the job grew during the read.
+                raise ProcessQueryUnavailable("暂时无法读取 Claude 作业进程。", error)
+            assigned = wintypes.DWORD.from_buffer(self._pid_buffer).value
+            capacity = max(assigned, (len(self._pid_buffer) - 8) // ctypes.sizeof(ctypes.c_size_t) * 2)
+            if capacity > 65536:
+                raise GuardError("Claude 作业进程数量超出保护器可处理范围。")
+            try:
+                self._pid_buffer = ctypes.create_string_buffer(8 + capacity * ctypes.sizeof(ctypes.c_size_t))
+            except MemoryError as exc:
+                raise ProcessQueryUnavailable("系统资源不足，暂时无法扩展 Claude 进程清单。", 14) from exc
+        raise ProcessQueryUnavailable("Claude 作业进程清单正在变化。", 24)
+
+    def active_count(self):
+        if not self.handle:
+            return 0
+        if not KERNEL.QueryInformationJobObject(self.handle, 1, ctypes.byref(self._accounting),
+                                               ctypes.sizeof(self._accounting), None):
+            raise ProcessQueryUnavailable("暂时无法读取 Claude 作业计数。", ctypes.get_last_error())
+        return self._accounting.ActiveProcesses
 
     def close(self):
         if self.handle:
@@ -737,8 +803,22 @@ class FirewallWatcher:
             process.terminate()
 
 
-def force_close_claude():
+def force_close_claude(job=None):
     """Kill all Claude image instances and their process trees, never the proxy."""
+    if job is not None:
+        # The known job owns the entire tree. Cleanup must not need a global scan.
+        if not job.terminate():
+            return False
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                if job.active_count() == 0:
+                    return True
+            except ProcessQueryUnavailable:
+                return False  # Termination sent; completion could not be read.
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
     if not claude_pids():
         return True
     try:
@@ -895,9 +975,12 @@ class NetworkMonitor:
                  process_reader=claude_pids, state_reader=system_proxy_state,
                  port_check=None, probe_factory=ExitProbe, state_writer=monitor_status,
                  firewall_checker=check_firewall, connectivity_factory=ConnectivityProbe,
-                 event_writer=None):
+                 event_writer=None, processes_owned=False):
         self.config, self.controller, self.baseline, self.job = config, controller, baseline, job
         self.clock, self.process_reader = clock, process_reader
+        self.processes_owned = processes_owned
+        self.last_processes = []
+        self.process_query_degraded = False
         self.state_reader = state_reader
         self.port_check = port_check or (lambda: local_proxy_alive(proxy_port(config)))
         self.probe_factory, self.state_writer = probe_factory, state_writer
@@ -922,10 +1005,29 @@ class NetworkMonitor:
         return validate_live_route(self.config, controller, runtime, proxies)
 
     def step(self):
-        pids = self.process_reader()
-        if pids:
+        try:
+            pids = self.process_reader()
+        except ProcessQueryUnavailable as exc:
+            if not self.processes_owned or exc.windows_error not in PROCESS_RESOURCE_ERRORS:
+                raise
+            if not self.process_query_degraded:
+                self.event_writer("process-query-degraded", "系统资源紧张，作业清单暂不可读；保留已有作业和防火墙保护。",
+                                  diagnostics=[{"windows_error": exc.windows_error}])
+            self.process_query_degraded = True
+            pids = None
+        else:
+            if self.process_query_degraded:
+                self.event_writer("process-query-recovered", "Claude 作业进程清单读取已恢复。")
+            self.process_query_degraded = False
+            self.last_processes = pids
+        if pids is None:
+            # Ownership is enforced by the existing kernel job, not this list.
+            # Never treat an unreadable list as an empty/exited application.
+            pids = self.last_processes
+        elif pids:
             self.saw_processes = True
-            self.job.attach(pids)
+            if not self.processes_owned:
+                self.job.attach(pids)
         elif self.saw_processes:
             return False  # User fully exited Claude normally.
         elif self.clock() > self.start_deadline:
@@ -1003,7 +1105,7 @@ class NetworkMonitor:
         if (self.connectivity_probe is None and self.next_connectivity is not None
                 and self.clock() >= self.next_connectivity):
             self.connectivity_probe = self.connectivity_factory(self.config["connectivity_timeout_seconds"], port=proxy_port(self.config))
-        if self.probe is None and self.clock() >= self.next_probe:
+        if self.config.get("runtime_remote_probes", True) and self.probe is None and self.clock() >= self.next_probe:
             self.probe = self.probe_factory(self.config["remote_timeout_seconds"],
                                             expected_ip=self.baseline["exit_ip"], port=proxy_port(self.config))
         if self.clock() >= self.next_status:
@@ -1012,6 +1114,8 @@ class NetworkMonitor:
                 message = ("出口查询暂不可用，正在独立 HTTPS 复核；防火墙保护仍有效。"
                            if self.next_connectivity is not None else
                            "出口查询暂不可用，独立 HTTPS 连通复核通过；防火墙保护仍有效。")
+            if self.process_query_degraded:
+                message = "系统资源紧张，进程清单暂不可读；作业、防火墙和代理保护继续生效。"
             self.state_writer("active", pids, message=message)
             self.next_status = self.clock() + 2
         return True
@@ -1027,7 +1131,10 @@ def supervise(monitor, close_claude=force_close_claude, sleeper=time.sleep):
         try:
             monitor.job.terminate()
         finally:
-            close_claude()
+            try:
+                close_claude()
+            except BaseException:
+                pass  # Cleanup must not replace the original fault/report.
         raise
 
 
@@ -1194,8 +1301,9 @@ def main():
         launch(config, job)
         protected = True
         record("monitor-starting", "网络检查通过，开始后台网络保护。", details)
-        monitor = NetworkMonitor(config, controller, details, job, firewall_checker=firewall_watcher.check)
-        supervise(monitor)
+        monitor = NetworkMonitor(config, controller, details, job, firewall_checker=firewall_watcher.check,
+                                 process_reader=job.pids, processes_owned=True)
+        supervise(monitor, close_claude=lambda: force_close_claude(job))
         monitor_status("stopped")
         record("stopped", "Claude 已正常退出，后台保护结束。")
         return 0
@@ -1204,7 +1312,10 @@ def main():
         if protected:
             if job:
                 job.terminate()
-            closed = force_close_claude()
+            try:
+                closed = force_close_claude(job)
+            except BaseException:
+                closed = False
             monitor_status("killed" if closed else "kill-failed", message=message)
             record("killed" if closed else "kill-failed", message)
             message += "\n\n" + ("已强制关闭 Claude 及其子进程。" if closed else "已发出强制关闭指令，但仍检测到 Claude 进程。")
